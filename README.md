@@ -1,3 +1,3 @@
 # Actions
 
-Resuable GitHub workflows for personal usage.
+Reusable GitHub workflows for personal usage.
