@@ -29,6 +29,8 @@ on:
         required: false
         default: "linux/amd64"
         type: string
+concurrency:
+  group: docker-${{ inputs.owner }}-${{ inputs.name }}
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
