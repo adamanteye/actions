@@ -71,7 +71,7 @@ jobs:
         if: ${{ inputs.push }}
         uses: dataaxiom/ghcr-cleanup-action@v1
         with:
-          delete-untagged: true
+          keep-n-untagged: 1
           keep-n-tagged: 2
           exclude-tags: latest
           package: ${{ inputs.name }}
