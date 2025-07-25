@@ -29,6 +29,10 @@ on:
         required: false
         default: "linux/amd64"
         type: string
+      rotate:
+        required: false
+        default: true
+        type: boolean
 concurrency:
   group: docker-${{ inputs.owner }}-${{ inputs.name }}
 jobs:
@@ -68,7 +72,7 @@ jobs:
           cache-to: type=gha,mode=max
           platforms: ${{ inputs.arch }}
       - name: Delete old images
-        if: ${{ inputs.push }}
+        if: ${{ inputs.push && inputs.rotate }}
         uses: dataaxiom/ghcr-cleanup-action@v1
         with:
           keep-n-untagged: 1
