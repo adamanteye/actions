@@ -1,0 +1,183 @@
+name: Reusable Helm Release
+on:
+  workflow_call:
+    inputs:
+      charts_dir:
+        required: false
+        default: "charts"
+        type: string
+      pages_branch:
+        required: false
+        default: "gh-pages"
+        type: string
+      config:
+        required: false
+        default: ""
+        type: string
+      push:
+        required: false
+        default: true
+        type: boolean
+      lint:
+        required: false
+        default: true
+        type: boolean
+      strict_lint:
+        required: false
+        default: false
+        type: boolean
+      initialize_pages_branch:
+        required: false
+        default: true
+        type: boolean
+      helm_version:
+        required: false
+        default: "v4.2.2"
+        type: string
+      chart_releaser_version:
+        required: false
+        default: "v1.7.0"
+        type: string
+      mark_as_latest:
+        required: false
+        default: false
+        type: boolean
+      packages_with_index:
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      changed_charts:
+        description: "Comma-separated list of charts released by chart-releaser."
+        value: ${{ jobs.release.outputs.changed_charts }}
+      chart_version:
+        description: "Version reported by chart-releaser."
+        value: ${{ jobs.release.outputs.chart_version }}
+concurrency:
+  group: helm-${{ github.repository }}-${{ inputs.charts_dir }}-${{ inputs.pages_branch }}
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      changed_charts: ${{ steps.release.outputs.changed_charts }}
+      chart_version: ${{ steps.release.outputs.chart_version }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+      - name: Set up Helm
+        if: ${{ inputs.lint }}
+        uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: ${{ inputs.helm_version }}
+      - name: Lint charts
+        if: ${{ inputs.lint }}
+        env:
+          CHARTS_DIR: ${{ inputs.charts_dir }}
+          STRICT_LINT: ${{ inputs.strict_lint }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d "$CHARTS_DIR" ]]; then
+            echo "::error::Helm charts directory '$CHARTS_DIR' does not exist."
+            exit 1
+          fi
+
+          mapfile -t chart_files < <(find "$CHARTS_DIR" -mindepth 2 -maxdepth 2 -name Chart.yaml -print | sort)
+          if [[ ${#chart_files[@]} -eq 0 ]]; then
+            echo "::error::No Helm charts found under '$CHARTS_DIR'."
+            exit 1
+          fi
+
+          lint_args=()
+          if [[ "$STRICT_LINT" == "true" ]]; then
+            lint_args+=(--strict)
+          fi
+
+          for chart_file in "${chart_files[@]}"; do
+            chart_dir="$(dirname "$chart_file")"
+            helm dependency build "$chart_dir"
+            helm lint "${lint_args[@]}" "$chart_dir"
+          done
+      - name: Configure Git
+        if: ${{ inputs.push }}
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+      - name: Initialize Pages branch
+        if: ${{ inputs.push && inputs.initialize_pages_branch }}
+        env:
+          PAGES_BRANCH: ${{ inputs.pages_branch }}
+        run: |
+          set -euo pipefail
+
+          if git ls-remote --exit-code --heads origin "$PAGES_BRANCH" >/dev/null 2>&1; then
+            echo "Pages branch '$PAGES_BRANCH' already exists."
+            exit 0
+          fi
+
+          repo_name="${GITHUB_REPOSITORY#*/}"
+          repo_url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${repo_name}"
+          if [[ "$repo_name" == "${GITHUB_REPOSITORY_OWNER}.github.io" ]]; then
+            repo_url="https://${GITHUB_REPOSITORY_OWNER}.github.io"
+          fi
+
+          repo_root="$(pwd)"
+          tmp="$(mktemp -d "${RUNNER_TEMP:-/tmp}/helm-pages.XXXXXX")"
+          cleanup() {
+            cd "$repo_root"
+            git worktree remove --force "$tmp" >/dev/null 2>&1 || rm -rf "$tmp"
+          }
+          trap cleanup EXIT
+
+          git worktree add --detach "$tmp" HEAD
+          pushd "$tmp" >/dev/null
+          git switch --orphan "$PAGES_BRANCH"
+          git rm -rf . >/dev/null 2>&1 || true
+          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+
+          cat > index.html <<EOF
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>${repo_name} Helm Charts</title>
+            <style>
+              body { font-family: system-ui, sans-serif; margin: 3rem auto; max-width: 52rem; padding: 0 1rem; line-height: 1.55; }
+              code, pre { background: #f6f8fa; border-radius: 6px; }
+              pre { padding: 1rem; overflow-x: auto; }
+              a { color: #0969da; }
+            </style>
+          </head>
+          <body>
+            <h1>${repo_name} Helm Charts</h1>
+            <pre><code>helm repo add ${repo_name} ${repo_url}
+          helm repo update</code></pre>
+            <p><a href="./index.yaml">Helm repository index</a></p>
+          </body>
+          </html>
+          EOF
+
+          touch .nojekyll
+          git add index.html .nojekyll
+          git commit -m "Initialize ${PAGES_BRANCH} Helm repository page"
+          git push origin "HEAD:${PAGES_BRANCH}"
+          popd >/dev/null
+      - name: Run chart-releaser
+        id: release
+        if: ${{ inputs.push }}
+        uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
+        with:
+          version: ${{ inputs.chart_releaser_version }}
+          charts_dir: ${{ inputs.charts_dir }}
+          config: ${{ inputs.config }}
+          skip_existing: true
+          mark_as_latest: ${{ inputs.mark_as_latest }}
+          packages_with_index: ${{ inputs.packages_with_index }}
+          pages_branch: ${{ inputs.pages_branch }}
+        env:
+          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
