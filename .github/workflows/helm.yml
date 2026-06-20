@@ -10,10 +10,6 @@ on:
         required: false
         default: "gh-pages"
         type: string
-      config:
-        required: false
-        default: ""
-        type: string
       push:
         required: false
         default: true
@@ -30,28 +26,20 @@ on:
         required: false
         default: true
         type: boolean
-      helm_version:
-        required: false
-        default: "v4.2.2"
-        type: string
-      chart_releaser_version:
-        required: false
-        default: "v1.7.0"
-        type: string
-      mark_as_latest:
+      github_release:
         required: false
         default: false
         type: boolean
-      packages_with_index:
+      mark_as_latest:
         required: false
         default: false
         type: boolean
     outputs:
       changed_charts:
-        description: "Comma-separated list of charts released by chart-releaser."
+        description: "Comma-separated list of charts packaged for the Helm repository."
         value: ${{ jobs.release.outputs.changed_charts }}
       chart_version:
-        description: "Version reported by chart-releaser."
+        description: "Version of the last packaged chart."
         value: ${{ jobs.release.outputs.chart_version }}
 concurrency:
   group: helm-${{ github.repository }}-${{ inputs.charts_dir }}-${{ inputs.pages_branch }}
@@ -62,17 +50,17 @@ jobs:
     permissions:
       contents: write
     outputs:
-      changed_charts: ${{ steps.release.outputs.changed_charts }}
-      chart_version: ${{ steps.release.outputs.chart_version }}
+      changed_charts: ${{ steps.package.outputs.changed_charts }}
+      chart_version: ${{ steps.package.outputs.chart_version }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           fetch-depth: 0
       - name: Set up Helm
-        if: ${{ inputs.lint }}
+        if: ${{ inputs.lint || inputs.push }}
         uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
         with:
-          version: ${{ inputs.helm_version }}
+          version: v4.2.2
       - name: Lint charts
         if: ${{ inputs.lint }}
         env:
@@ -102,22 +90,86 @@ jobs:
             helm dependency build "$chart_dir"
             helm lint "${lint_args[@]}" "$chart_dir"
           done
-      - name: Configure Git
+      - name: Package charts
+        id: package
         if: ${{ inputs.push }}
-        run: |
-          git config user.name "$GITHUB_ACTOR"
-          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
-      - name: Initialize Pages branch
-        if: ${{ inputs.push && inputs.initialize_pages_branch }}
         env:
+          CHARTS_DIR: ${{ inputs.charts_dir }}
           PAGES_BRANCH: ${{ inputs.pages_branch }}
         run: |
           set -euo pipefail
 
+          if [[ ! -d "$CHARTS_DIR" ]]; then
+            echo "::error::Helm charts directory '$CHARTS_DIR' does not exist."
+            exit 1
+          fi
+
+          mapfile -t all_charts < <(find "$CHARTS_DIR" -mindepth 2 -maxdepth 2 -name Chart.yaml -exec dirname {} \; | sort)
+          if [[ ${#all_charts[@]} -eq 0 ]]; then
+            echo "::error::No Helm charts found under '$CHARTS_DIR'."
+            exit 1
+          fi
+
+          pages_has_index=false
           if git ls-remote --exit-code --heads origin "$PAGES_BRANCH" >/dev/null 2>&1; then
-            echo "Pages branch '$PAGES_BRANCH' already exists."
+            git fetch --depth=1 origin "$PAGES_BRANCH"
+            if git cat-file -e FETCH_HEAD:index.yaml 2>/dev/null; then
+              pages_has_index=true
+            fi
+          fi
+
+          changed_charts=()
+          if [[ "$pages_has_index" != "true" ]]; then
+            changed_charts=("${all_charts[@]}")
+          else
+            latest_ref="$(git describe --tags --abbrev=0 HEAD~ 2>/dev/null || git rev-list --max-parents=0 --first-parent HEAD)"
+            for chart_dir in "${all_charts[@]}"; do
+              if ! git diff --quiet "$latest_ref" -- "$chart_dir"; then
+                changed_charts+=("$chart_dir")
+              fi
+            done
+          fi
+
+          if [[ ${#changed_charts[@]} -eq 0 ]]; then
+            echo "No chart changes detected."
+            {
+              echo "changed_charts="
+              echo "chart_version="
+              echo "has_packages=false"
+            } >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          package_dir=".helm-release-packages"
+          rm -rf "$package_dir"
+          mkdir -p "$package_dir"
+
+          chart_version=""
+          for chart_dir in "${changed_charts[@]}"; do
+            chart_version="$(helm show chart "$chart_dir" | awk -F': *' '$1 == "version" { print $2; exit }')"
+            helm dependency build "$chart_dir"
+            helm package "$chart_dir" --destination "$package_dir"
+          done
+
+          changed_csv="$(IFS=,; echo "${changed_charts[*]}")"
+          {
+            echo "changed_charts=$changed_csv"
+            echo "chart_version=$chart_version"
+            echo "has_packages=true"
+          } >> "$GITHUB_OUTPUT"
+      - name: Configure Git
+        if: ${{ inputs.push && steps.package.outputs.has_packages == 'true' }}
+        run: |
+          git config user.name "$GITHUB_ACTOR"
+          git config user.email "$GITHUB_ACTOR@users.noreply.github.com"
+      - name: Publish chart repository to Pages branch
+        if: ${{ inputs.push && steps.package.outputs.has_packages == 'true' }}
+        env:
+          INITIALIZE_PAGES_BRANCH: ${{ inputs.initialize_pages_branch }}
+          PACKAGE_DIR: .helm-release-packages
+          PAGES_BRANCH: ${{ inputs.pages_branch }}
+        run: |
+          set -euo pipefail
 
           repo_name="${GITHUB_REPOSITORY#*/}"
           repo_url="https://${GITHUB_REPOSITORY_OWNER}.github.io/${repo_name}"
@@ -126,20 +178,32 @@ jobs:
           fi
 
           repo_root="$(pwd)"
-          tmp="$(mktemp -d "${RUNNER_TEMP:-/tmp}/helm-pages.XXXXXX")"
+          pages_worktree="$(mktemp -d "${RUNNER_TEMP:-/tmp}/helm-pages.XXXXXX")"
           cleanup() {
             cd "$repo_root"
-            git worktree remove --force "$tmp" >/dev/null 2>&1 || rm -rf "$tmp"
+            git worktree remove --force "$pages_worktree" >/dev/null 2>&1 || rm -rf "$pages_worktree"
           }
           trap cleanup EXIT
 
-          git worktree add --detach "$tmp" HEAD
-          pushd "$tmp" >/dev/null
-          git switch --orphan "$PAGES_BRANCH"
-          git rm -rf . >/dev/null 2>&1 || true
-          find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          if git ls-remote --exit-code --heads origin "$PAGES_BRANCH" >/dev/null 2>&1; then
+            git fetch --depth=1 origin "$PAGES_BRANCH"
+            git worktree add --detach "$pages_worktree" FETCH_HEAD
+          elif [[ "$INITIALIZE_PAGES_BRANCH" == "true" ]]; then
+            git worktree add --detach "$pages_worktree" HEAD
+            pushd "$pages_worktree" >/dev/null
+            git switch --orphan "$PAGES_BRANCH"
+            git rm -rf . >/dev/null 2>&1 || true
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+            popd >/dev/null
+          else
+            echo "::error::Pages branch '$PAGES_BRANCH' does not exist."
+            exit 1
+          fi
 
-          cat > index.html <<EOF
+          cp "$PACKAGE_DIR"/*.tgz "$pages_worktree"/
+          helm repo index "$pages_worktree" --url "$repo_url"
+
+          cat > "$pages_worktree/index.html" <<EOF
           <!doctype html>
           <html lang="en">
           <head>
@@ -161,23 +225,88 @@ jobs:
           </body>
           </html>
           EOF
+          touch "$pages_worktree/.nojekyll"
 
-          touch .nojekyll
-          git add index.html .nojekyll
-          git commit -m "Initialize ${PAGES_BRANCH} Helm repository page"
-          git push origin "HEAD:${PAGES_BRANCH}"
-          popd >/dev/null
-      - name: Run chart-releaser
-        id: release
-        if: ${{ inputs.push }}
-        uses: helm/chart-releaser-action@cae68fefc6b5f367a0275617c9f83181ba54714f # v1.7.0
-        with:
-          version: ${{ inputs.chart_releaser_version }}
-          charts_dir: ${{ inputs.charts_dir }}
-          config: ${{ inputs.config }}
-          skip_existing: true
-          mark_as_latest: ${{ inputs.mark_as_latest }}
-          packages_with_index: ${{ inputs.packages_with_index }}
-          pages_branch: ${{ inputs.pages_branch }}
+          git -C "$pages_worktree" add -A
+          if git -C "$pages_worktree" diff --cached --quiet; then
+            echo "Pages branch '$PAGES_BRANCH' is already up to date."
+            exit 0
+          fi
+
+          git -C "$pages_worktree" commit -m "Publish Helm chart packages"
+          git -C "$pages_worktree" push origin "HEAD:refs/heads/$PAGES_BRANCH"
+      - name: Publish GitHub releases
+        if: ${{ inputs.push && inputs.github_release && steps.package.outputs.has_packages == 'true' }}
         env:
-          CR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MARK_AS_LATEST: ${{ inputs.mark_as_latest }}
+          PACKAGE_DIR: .helm-release-packages
+        run: |
+          set -euo pipefail
+
+          api_url="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          api_headers=(
+            -H "Accept: application/vnd.github+json"
+            -H "Authorization: Bearer ${GITHUB_TOKEN}"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+          )
+
+          for package in "$PACKAGE_DIR"/*.tgz; do
+            metadata="$(helm show chart "$package")"
+            chart_name="$(awk -F': *' '$1 == "name" { print $2; exit }' <<< "$metadata")"
+            chart_version="$(awk -F': *' '$1 == "version" { print $2; exit }' <<< "$metadata")"
+            description="$(awk -F': *' '$1 == "description" { print $2; exit }' <<< "$metadata")"
+            release_name="${chart_name}-${chart_version}"
+            encoded_release_name="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$release_name")"
+
+            status="$(curl -sS -o release.json -w "%{http_code}" "${api_headers[@]}" "$api_url/releases/tags/$encoded_release_name")"
+            if [[ "$status" == "200" ]]; then
+              echo "GitHub release '$release_name' already exists. Skipping."
+              continue
+            fi
+            if [[ "$status" != "404" ]]; then
+              cat release.json
+              exit 1
+            fi
+
+            payload="$(
+              python3 - "$release_name" "$description" "$GITHUB_SHA" "$MARK_AS_LATEST" <<'PY'
+          import json
+          import sys
+
+          release_name, description, target, mark_as_latest = sys.argv[1:5]
+          print(json.dumps({
+              "tag_name": release_name,
+              "name": release_name,
+              "body": description or f"Helm chart package for {release_name}.",
+              "target_commitish": target,
+              "make_latest": "true" if mark_as_latest == "true" else "false",
+          }))
+          PY
+            )"
+
+            create_status="$(curl -sS -o created_release.json -w "%{http_code}" "${api_headers[@]}" -X POST -d "$payload" "$api_url/releases")"
+            if [[ "$create_status" != "201" ]]; then
+              cat created_release.json
+              exit 1
+            fi
+
+            upload_url="$(python3 -c 'import json, sys; print(json.load(sys.stdin)["upload_url"].split("{", 1)[0])' < created_release.json)"
+            for asset in "$package" "$package.prov"; do
+              [[ -f "$asset" ]] || continue
+              asset_name="$(basename "$asset")"
+              encoded_asset_name="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$asset_name")"
+              upload_status="$(
+                curl -sS -o upload.json -w "%{http_code}" \
+                  "${api_headers[@]}" \
+                  -H "Content-Type: application/octet-stream" \
+                  -X POST \
+                  --data-binary "@$asset" \
+                  "${upload_url}?name=${encoded_asset_name}"
+              )"
+              if [[ "$upload_status" != "201" ]]; then
+                cat upload.json
+                exit 1
+              fi
+            done
+          done
